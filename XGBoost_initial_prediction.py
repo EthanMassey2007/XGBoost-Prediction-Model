@@ -165,7 +165,13 @@ rmse = np.sqrt(mean_squared_error(y_test, y_pred_calib))
 mae = mean_absolute_error(y_test, y_pred_calib)
 r2 = r2_score(y_test, y_pred_calib)
 
+total_actual = float(np.sum(np.abs(y_test)))
+wape = float(np.sum(np.abs(y_test - y_pred_calib)) / max(total_actual, 1e-9))
+accuracy_pct = max(0.0, 100.0 * (1.0 - wape))
+
 print(f"\nModel Accuracy on Test Set ({HORIZON}-week ahead):")
+print(f"  WAPE: {wape:.4f}")
+print(f"  WAPE-based accuracy (%): {accuracy_pct:.2f}")
 print(f"  RMSE: {rmse:.2f}")
 print(f"  MAE: {mae:.2f}")
 print(f"  R²: {r2:.3f}\n")
