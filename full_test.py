@@ -9,14 +9,18 @@ import os
 # -----------------------------
 # Parameters
 # -----------------------------
+base_dir = os.path.dirname(__file__)
+data_dir = os.path.join(base_dir, "data")
+
 municipio_info = {"name": "Rio de Janeiro"}
-DATA_DIR = os.path.expanduser("~/Desktop")
-CASES_FILE = os.path.join(DATA_DIR, "cases.csv")
-TEMP_FILE = os.path.join(DATA_DIR, "temperature.csv")
-HUMID_FILE = os.path.join(DATA_DIR, "humidity.csv")
-RAIN_FILE = os.path.join(DATA_DIR, "rainfall.csv")
-POP_FILE = os.path.join(DATA_DIR, "population.csv")
-IDHM_FILE = os.path.join(DATA_DIR, "idhm.csv")
+CASES_FILE = os.path.join(data_dir, "cases.csv")
+TEMP_FILE = os.path.join(data_dir, "temperature.csv")
+HUMID_FILE = os.path.join(data_dir, "humidity.csv")
+RAIN_FILE = os.path.join(data_dir, "rainfall.csv")
+IDHM_FILE = os.path.join(data_dir, "idhm.csv")
+POP_FILE = os.path.join(data_dir, "population.csv")
+
+
 
 lags = [1, 2, 3, 4, 6, 8, 12]  # Lag features
 training_years = list(range(2011, 2025))

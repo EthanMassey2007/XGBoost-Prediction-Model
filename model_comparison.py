@@ -12,15 +12,17 @@ from shapely.ops import unary_union
 # -----------------------------
 # PARAMETERS
 # -----------------------------
+base_dir = os.path.dirname(__file__)
+data_dir = os.path.join(base_dir, "data")
+
 municipio_info = {"name": "Rio de Janeiro"}
-DATA_DIR = os.path.expanduser("~/Desktop")
-CASES_FILE = os.path.join(DATA_DIR, "cases.csv")
-TEMP_FILE = os.path.join(DATA_DIR, "temperature.csv")
-HUMID_FILE = os.path.join(DATA_DIR, "humidity.csv")
-RAIN_FILE = os.path.join(DATA_DIR, "rainfall.csv")
-POP_FILE = os.path.join(DATA_DIR, "population.csv")
-IDHM_FILE = os.path.join(DATA_DIR, "idhm.csv")
-GEOJSON_FILE = os.path.join(DATA_DIR, "RJ.json")  # GeoJSON for adjacency
+CASES_FILE = os.path.join(data_dir, "cases.csv")
+TEMP_FILE = os.path.join(data_dir, "temperature.csv")
+HUMID_FILE = os.path.join(data_dir, "humidity.csv")
+RAIN_FILE = os.path.join(data_dir, "rainfall.csv")
+IDHM_FILE = os.path.join(data_dir, "idhm.csv")
+POP_FILE = os.path.join(data_dir, "population.csv")
+GEOJSON_FILE = os.path.join(data_dir, "RJ.json")  # GeoJSON for adjacency
 
 lags = [1, 2, 3, 4, 6, 8, 12]  # lag features
 MAX_DISTANCE_METERS = 5000     # adjacency tolerance
