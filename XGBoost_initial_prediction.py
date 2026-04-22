@@ -21,7 +21,7 @@ IDHM_FILE = os.path.join(data_dir, "idhm.csv")
 POP_FILE = os.path.join(data_dir, "population.csv")
 GEOJSON_FILE = os.path.join(data_dir, "RJ.json")  # GeoJSON for adjacency
 
-HORIZON = 2 # Predict HORIZON weeks ahead
+HORIZON = 1 # Predict HORIZON weeks ahead
 lags = [1, 2, 3, 4, 6, 8, 12]  # Lag features
 
 # -----------------------------
@@ -113,7 +113,7 @@ feature_cols = ['RAINFALL', 'TEMP', 'HUMIDITY', 'POPULATION', 'IDHM', 'IMMUNITY'
 # 6) Train/Test Split (train ≤2024, test >2024)
 # -----------------------------
 training_threshold = 2012
-train_mask = data_df['year'] <= training_threshold
+train_mask = data_df['year'] < training_threshold
 test_mask = data_df['year'] > training_threshold
 
 X_train = data_df.loc[train_mask, feature_cols]
