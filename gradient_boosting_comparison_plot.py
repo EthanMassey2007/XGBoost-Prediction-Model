@@ -226,7 +226,7 @@ for horizon in range(15):
     # Train XGBoost (log-transform)
     # -----------------------------
     y_train_log = np.log1p(y_train)
-    model = Ridge(alpha=2.4304352434763596)
+    model = GradientBoostingRegressor(n_estimators=639, learning_rate=0.06053197206271428, max_depth=3, subsample = 0.8013654487520273)
     model.fit(X_train, y_train_log)
 
     y_pred_log = model.predict(X_test)
@@ -276,7 +276,7 @@ plt.plot(x_values, y_values, marker='o', markersize=5, linestyle='-', color='tab
 
 plt.xlabel('HORIZON', fontsize=10, fontweight='bold')
 plt.ylabel('R²', fontsize=10, fontweight='bold')
-plt.title('Ridge Regression Accuracy', fontsize=12, fontweight='bold')
+plt.title('Gradient Boosting Accuracy', fontsize=12, fontweight='bold')
 
 plt.xticks(x_values[::2])  # every 2 horizons
 plt.tick_params(axis='both', which='both', length=6)  # show tick marks
@@ -289,7 +289,7 @@ plt.savefig('horizon_r2_plot.png', dpi=300, bbox_inches='tight')
 import csv
 
 # Save the horizons and R² values
-output_file = os.path.join(DATA_DIR, "ridge_r2.csv")
+output_file = os.path.join(DATA_DIR, "gradient_r2.csv")
 with open(output_file, 'w', newline='') as f:
     writer = csv.writer(f)
     writer.writerow(['horizon', 'r2'])
