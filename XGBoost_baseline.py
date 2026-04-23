@@ -26,13 +26,16 @@ POP_FILE = os.path.join(data_dir, "population.csv")
 GEOJSON_FILE = os.path.join(data_dir, "RJ.json")
 
 LAGS = [1, 2, 3, 4, 6, 8, 12]
+HORIZONS = range(1, 16)
 MAX_DISTANCE_METERS = 5000
 
-HORIZON = 1
-TRAINING_THRESHOLDS = list(range(2011, 2025))  # train <= threshold, test > threshold
+TRAIN_END_YEAR = 2018
+VALID_END_YEAR = 2021
+TEST_START_YEAR = 2022
+TEST_END_YEAR = 2025
 
-PLOT_FILE = os.path.join(base_dir, "xgboost_rmse_mae_vs_training_threshold.png")
-METRICS_FILE = os.path.join(base_dir, "xgboost_training_threshold_metrics.csv")
+PLOT_FILE = os.path.join(base_dir, "xgboost_horizon_r2_plot.png")
+METRICS_FILE = os.path.join(base_dir, "xgboost_horizon_metrics.csv")
 
 
 # -----------------------------
@@ -120,6 +123,12 @@ def add_population_and_idhm(data_df, municipio_name):
     return data_df
 
 
+def previous_iso_week(year, week):
+    ts = pd.Timestamp.fromisocalendar(int(year), int(week), 1) - pd.Timedelta(weeks=1)
+    iso = ts.isocalendar()
+    return int(iso.year), int(iso.week)
+
+
 def build_base_dataframe():
     rio_cases_df = load_csv_data_single(CASES_FILE, municipio_info["name"], "cases")
     rio_temp_df = load_csv_data_single(TEMP_FILE, municipio_info["name"], "temperature")
@@ -181,28 +190,24 @@ def build_base_dataframe():
     cases_spatial, rain_spatial, temp_spatial, hum_spatial, n_neighbors = [], [], [], [], []
 
     for _, row in data_df.iterrows():
-        y = int(row["year"])
-        w = int(row["week"]) - 1
-        if w <= 0:
-            y -= 1
-            w = 52
+        y_prev, w_prev = previous_iso_week(int(row["year"]), int(row["week"]))
 
         neigh_vals_cases, neigh_vals_rain, neigh_vals_temp, neigh_vals_hum = [], [], [], []
         for n in neighbors:
             try:
-                neigh_vals_cases.append(cases_idx.loc[(y, w, n), "value"])
+                neigh_vals_cases.append(cases_idx.loc[(y_prev, w_prev, n), "value"])
             except KeyError:
                 pass
             try:
-                neigh_vals_rain.append(rain_idx.loc[(y, w, n), "value"])
+                neigh_vals_rain.append(rain_idx.loc[(y_prev, w_prev, n), "value"])
             except KeyError:
                 pass
             try:
-                neigh_vals_temp.append(temp_idx.loc[(y, w, n), "value"])
+                neigh_vals_temp.append(temp_idx.loc[(y_prev, w_prev, n), "value"])
             except KeyError:
                 pass
             try:
-                neigh_vals_hum.append(hum_idx.loc[(y, w, n), "value"])
+                neigh_vals_hum.append(hum_idx.loc[(y_prev, w_prev, n), "value"])
             except KeyError:
                 pass
 
@@ -231,8 +236,15 @@ def build_base_dataframe():
         data_df["HUMIDITY"].shift(1)
     )
 
+    data_df["CASES_SPATIAL_MISSING"] = data_df["CASES_SPATIAL_LAG1"].isna().astype(int)
+    data_df["RAINFALL_SPATIAL_MISSING"] = data_df["RAINFALL_SPATIAL_LAG1"].isna().astype(int)
+    data_df["TEMP_SPATIAL_MISSING"] = data_df["TEMP_SPATIAL_LAG1"].isna().astype(int)
+    data_df["HUMIDITY_SPATIAL_MISSING"] = data_df["HUMIDITY_SPATIAL_LAG1"].isna().astype(int)
+
     data_df = add_population_and_idhm(data_df, municipio_info["name"])
-    data_df = data_df[(data_df["year"] >= 2010) & (data_df["year"] <= 2025)].reset_index(drop=True)
+    data_df = data_df[(data_df["year"] >= 2010) & (data_df["year"] <= 2025)].reset_index(
+        drop=True
+    )
     data_df = data_df.sort_values(["year", "week"]).reset_index(drop=True)
 
     return data_df
@@ -256,6 +268,8 @@ def add_features(df):
         for lag in LAGS:
             df[f"{col}_lag{lag}"] = df[col].shift(lag)
         df[f"{col}_roll3"] = df[col].shift(1).rolling(3, min_periods=1).mean()
+        df[f"{col}_roll6"] = df[col].shift(1).rolling(6, min_periods=1).mean()
+        df[f"{col}_roll12"] = df[col].shift(1).rolling(12, min_periods=1).mean()
 
     decay = 0.8
     K = 10
@@ -271,8 +285,16 @@ def add_features(df):
     df["IMMUNITY"] = immunity
 
     df["YEAR_INDEX"] = (
-        (df["year"].astype(int) - df["year"].astype(int).min()) * 52 + df["week"].astype(int)
+        (df["year"].astype(int) - df["year"].astype(int).min()) * 52
+        + df["week"].astype(int)
     )
+
+    week_float = df["week"].astype(float)
+    df["WEEK_SIN"] = np.sin(2 * np.pi * week_float / 52.0)
+    df["WEEK_COS"] = np.cos(2 * np.pi * week_float / 52.0)
+
+    df["DENGUE_GROWTH_LAG1_LAG2"] = df["DENGUE_CASES_lag1"] - df["DENGUE_CASES_lag2"]
+    df["DENGUE_GROWTH_LAG1_LAG4"] = df["DENGUE_CASES_lag1"] - df["DENGUE_CASES_lag4"]
 
     return df
 
@@ -284,6 +306,14 @@ def build_feature_columns(df):
         "IMMUNITY",
         "NUM_NEIGHBORS_AVAILABLE",
         "YEAR_INDEX",
+        "WEEK_SIN",
+        "WEEK_COS",
+        "CASES_SPATIAL_MISSING",
+        "RAINFALL_SPATIAL_MISSING",
+        "TEMP_SPATIAL_MISSING",
+        "HUMIDITY_SPATIAL_MISSING",
+        "DENGUE_GROWTH_LAG1_LAG2",
+        "DENGUE_GROWTH_LAG1_LAG4",
     ]
     lag_cols = [c for c in df.columns if "_lag" in c or "_roll" in c]
     return base_cols + sorted(lag_cols)
@@ -298,114 +328,199 @@ def evaluate_predictions(y_true, y_pred):
     return {"rmse": rmse, "mae": mae, "r2": r2, "wape": wape}
 
 
-def fit_xgboost_with_validation_calibration(X_train, y_train, X_valid, y_valid, X_test):
+def fit_xgboost_uncalibrated(X_train, y_train, X_valid, X_test):
     model = XGBRegressor(
-        n_estimators=623,
-        learning_rate=0.02081058596075694,
+        n_estimators=1200,
+        learning_rate=0.02,
         max_depth=3,
-        subsample=0.8242253369150914,
-        colsample_bytree=0.9918052007526491,
+        subsample=0.85,
+        colsample_bytree=0.9,
+        reg_alpha=0.0,
+        reg_lambda=1.0,
+        min_child_weight=3,
         random_state=42,
         objective="reg:squarederror",
+        early_stopping_rounds=50,
     )
 
     y_train_log = np.log1p(y_train)
-    model.fit(X_train, y_train_log)
+    y_valid_log = np.log1p(np.clip(y_train[: len(X_valid)] * 0 + 0, 0, None))  # placeholder not used
 
-    valid_pred_raw = np.expm1(model.predict(X_valid))
-    test_pred_raw = np.expm1(model.predict(X_test))
+    model.fit(
+        X_train,
+        y_train_log,
+        eval_set=[(X_valid, np.log1p(np.clip(y_valid_for_fit, 0, None)))],
+        verbose=False,
+    )
+
+    valid_pred = np.expm1(model.predict(X_valid))
+    test_pred = np.expm1(model.predict(X_test))
+
+    valid_pred = np.clip(valid_pred, 0, None)
+    test_pred = np.clip(test_pred, 0, None)
+
+    return valid_pred, test_pred
+
+
+def fit_xgboost_uncalibrated(X_train, y_train, X_valid, y_valid, X_test):
+    model = XGBRegressor(
+        n_estimators=1200,
+        learning_rate=0.02,
+        max_depth=3,
+        subsample=0.85,
+        colsample_bytree=0.9,
+        reg_alpha=0.0,
+        reg_lambda=1.0,
+        min_child_weight=3,
+        random_state=42,
+        objective="reg:squarederror",
+        early_stopping_rounds=50,
+    )
+
+    y_train_log = np.log1p(y_train)
+    y_valid_log = np.log1p(y_valid)
+
+    model.fit(
+        X_train,
+        y_train_log,
+        eval_set=[(X_valid, y_valid_log)],
+        verbose=False,
+    )
+
+    valid_pred = np.expm1(model.predict(X_valid))
+    test_pred = np.expm1(model.predict(X_test))
+
+    valid_pred = np.clip(valid_pred, 0, None)
+    test_pred = np.clip(test_pred, 0, None)
+
+    return valid_pred, test_pred
+
+
+def fit_xgboost_with_validation_calibration(X_train, y_train, X_valid, y_valid, X_test):
+    valid_pred_raw, test_pred_raw = fit_xgboost_uncalibrated(
+        X_train, y_train, X_valid, y_valid, X_test
+    )
 
     calib = LinearRegression()
     calib.fit(valid_pred_raw.reshape(-1, 1), y_valid)
 
+    valid_pred = np.clip(calib.predict(valid_pred_raw.reshape(-1, 1)), 0, None)
     test_pred = np.clip(calib.predict(test_pred_raw.reshape(-1, 1)), 0, None)
-    return test_pred
+
+    return valid_pred, test_pred
 
 
 def main():
     base_df = build_base_dataframe()
     featured_df = add_features(base_df)
 
-    model_df = featured_df.copy()
-    model_df[f"TARGET_{HORIZON}W_AHEAD"] = model_df["DENGUE_CASES"].shift(-HORIZON)
-    model_df = model_df.dropna(subset=[f"TARGET_{HORIZON}W_AHEAD"]).copy()
-
-    feature_cols = build_feature_columns(model_df)
-    model_df = model_df.dropna(subset=feature_cols).copy()
-
-    thresholds = []
-    rmse_scores = []
-    mae_scores = []
+    calibrated_scores = []
+    uncalibrated_scores = []
     all_metrics = []
 
-    for threshold in TRAINING_THRESHOLDS:
-        train_mask = model_df["year"] <= threshold
-        test_mask = model_df["year"] > threshold
+    for horizon in HORIZONS:
+        model_df = featured_df.copy()
+        model_df[f"TARGET_{horizon}W_AHEAD"] = model_df["DENGUE_CASES"].shift(-horizon)
+        model_df = model_df.dropna(subset=[f"TARGET_{horizon}W_AHEAD"]).copy()
 
-        X_train_full = model_df.loc[train_mask, feature_cols].to_numpy(dtype=float)
-        y_train_full = model_df.loc[train_mask, f"TARGET_{HORIZON}W_AHEAD"].to_numpy(dtype=float)
-        X_test = model_df.loc[test_mask, feature_cols].to_numpy(dtype=float)
-        y_test = model_df.loc[test_mask, f"TARGET_{HORIZON}W_AHEAD"].to_numpy(dtype=float)
+        feature_cols = build_feature_columns(model_df)
+        model_df = model_df.dropna(subset=feature_cols).copy()
 
-        if min(len(X_train_full), len(X_test)) == 0:
-            continue
+        train_mask = model_df["year"] <= TRAIN_END_YEAR
+        valid_mask = (model_df["year"] > TRAIN_END_YEAR) & (model_df["year"] <= VALID_END_YEAR)
+        test_mask = (model_df["year"] >= TEST_START_YEAR) & (model_df["year"] <= TEST_END_YEAR)
 
-        # carve validation set from the end of the training period
-        valid_year = threshold
-        train_inner_mask = model_df["year"] < valid_year
-        valid_mask = model_df["year"] == valid_year
-
-        X_train = model_df.loc[train_inner_mask, feature_cols].to_numpy(dtype=float)
-        y_train = model_df.loc[train_inner_mask, f"TARGET_{HORIZON}W_AHEAD"].to_numpy(dtype=float)
+        X_train = model_df.loc[train_mask, feature_cols].to_numpy(dtype=float)
+        y_train = model_df.loc[train_mask, f"TARGET_{horizon}W_AHEAD"].to_numpy(dtype=float)
         X_valid = model_df.loc[valid_mask, feature_cols].to_numpy(dtype=float)
-        y_valid = model_df.loc[valid_mask, f"TARGET_{HORIZON}W_AHEAD"].to_numpy(dtype=float)
+        y_valid = model_df.loc[valid_mask, f"TARGET_{horizon}W_AHEAD"].to_numpy(dtype=float)
+        X_test = model_df.loc[test_mask, feature_cols].to_numpy(dtype=float)
+        y_test = model_df.loc[test_mask, f"TARGET_{horizon}W_AHEAD"].to_numpy(dtype=float)
 
         if min(len(X_train), len(X_valid), len(X_test)) == 0:
-            continue
+            raise ValueError(f"Empty split for horizon {horizon}. Check year ranges.")
 
-        test_pred = fit_xgboost_with_validation_calibration(
+        valid_pred_uncal, test_pred_uncal = fit_xgboost_uncalibrated(
             X_train, y_train, X_valid, y_valid, X_test
         )
-        test_metrics = evaluate_predictions(y_test, test_pred)
+        valid_pred_cal, test_pred_cal = fit_xgboost_with_validation_calibration(
+            X_train, y_train, X_valid, y_valid, X_test
+        )
 
-        thresholds.append(threshold)
-        rmse_scores.append(test_metrics["rmse"])
-        mae_scores.append(test_metrics["mae"])
+        valid_metrics_uncal = evaluate_predictions(y_valid, valid_pred_uncal)
+        test_metrics_uncal = evaluate_predictions(y_test, test_pred_uncal)
+        valid_metrics_cal = evaluate_predictions(y_valid, valid_pred_cal)
+        test_metrics_cal = evaluate_predictions(y_test, test_pred_cal)
+
+        uncalibrated_scores.append(test_metrics_uncal["r2"])
+        calibrated_scores.append(test_metrics_cal["r2"])
+
         all_metrics.append(
             {
-                "training_threshold": threshold,
-                "train_years": f"2010-{threshold}",
-                "test_years": f"{threshold + 1}-2025",
-                "test_rmse": test_metrics["rmse"],
-                "test_mae": test_metrics["mae"],
-                "test_r2": test_metrics["r2"],
-                "test_wape": test_metrics["wape"],
-                "n_train": len(X_train_full),
-                "n_test": len(X_test),
+                "horizon": horizon,
+                "model": "XGBoost_uncalibrated",
+                "valid_r2": valid_metrics_uncal["r2"],
+                "valid_rmse": valid_metrics_uncal["rmse"],
+                "valid_mae": valid_metrics_uncal["mae"],
+                "valid_wape": valid_metrics_uncal["wape"],
+                "test_r2": test_metrics_uncal["r2"],
+                "test_rmse": test_metrics_uncal["rmse"],
+                "test_mae": test_metrics_uncal["mae"],
+                "test_wape": test_metrics_uncal["wape"],
+            }
+        )
+        all_metrics.append(
+            {
+                "horizon": horizon,
+                "model": "XGBoost_calibrated",
+                "valid_r2": valid_metrics_cal["r2"],
+                "valid_rmse": valid_metrics_cal["rmse"],
+                "valid_mae": valid_metrics_cal["mae"],
+                "valid_wape": valid_metrics_cal["wape"],
+                "test_r2": test_metrics_cal["r2"],
+                "test_rmse": test_metrics_cal["rmse"],
+                "test_mae": test_metrics_cal["mae"],
+                "test_wape": test_metrics_cal["wape"],
             }
         )
 
         print(
-            f"Train 2010-{threshold}, Test {threshold + 1}-2025: "
-            f"RMSE={test_metrics['rmse']:.2f}, "
-            f"MAE={test_metrics['mae']:.2f}, "
-            f"R2={test_metrics['r2']:.4f}, "
-            f"WAPE={test_metrics['wape']:.4f}"
+            f"Horizon {horizon}: "
+            f"uncal_test_r2={test_metrics_uncal['r2']:.4f}, "
+            f"cal_test_r2={test_metrics_cal['r2']:.4f}, "
+            f"uncal_test_wape={test_metrics_uncal['wape']:.4f}, "
+            f"cal_test_wape={test_metrics_cal['wape']:.4f}"
         )
 
     metrics_df = pd.DataFrame(all_metrics)
     metrics_df.to_csv(METRICS_FILE, index=False)
     print(f"Saved metrics to: {METRICS_FILE}")
 
-    plt.figure(figsize=(6, 3.5), dpi=300)
-    plt.plot(thresholds, rmse_scores, marker="o", linewidth=1.8, label="RMSE")
-    plt.plot(thresholds, mae_scores, marker="s", linewidth=1.8, label="MAE")
-    plt.xlabel("Training Threshold Year", fontsize=10)
-    plt.ylabel("Error", fontsize=10)
-    plt.title("XGBoost: RMSE and MAE vs Training Threshold", fontsize=12)
-    plt.xticks(thresholds[::2] if len(thresholds) > 1 else thresholds)
+    x_values = np.arange(1, len(calibrated_scores) + 1)
+    plt.figure(figsize=(6, 4), dpi=300)
+    plt.plot(
+        x_values,
+        uncalibrated_scores,
+        marker="o",
+        markersize=4,
+        linewidth=1.8,
+        label="XGBoost Uncalibrated",
+    )
+    plt.plot(
+        x_values,
+        calibrated_scores,
+        marker="s",
+        markersize=4,
+        linewidth=1.8,
+        label="XGBoost Calibrated",
+    )
+    plt.xlabel("Horizon (weeks)", fontsize=10, fontweight="bold")
+    plt.ylabel("Test R²", fontsize=10, fontweight="bold")
+    plt.title("XGBoost: Test R² vs Forecast Horizon", fontsize=12, fontweight="bold")
+    plt.xticks(x_values[::2])
     plt.tick_params(axis="both", which="both", length=6)
-    plt.legend(fontsize=5, frameon=True)
+    plt.yticks(fontsize=8)
+    plt.legend(fontsize=8, frameon=True)
     plt.grid(False)
     plt.tight_layout()
     plt.savefig(PLOT_FILE, dpi=300, bbox_inches="tight")

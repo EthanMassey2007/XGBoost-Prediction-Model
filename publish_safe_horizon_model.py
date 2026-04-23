@@ -5,7 +5,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from shapely.ops import unary_union
-from sklearn.linear_model import LinearRegression
+from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
+from sklearn.linear_model import LinearRegression, Ridge
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from xgboost import XGBRegressor
 
@@ -26,13 +27,15 @@ POP_FILE = os.path.join(data_dir, "population.csv")
 GEOJSON_FILE = os.path.join(data_dir, "RJ.json")
 
 LAGS = [1, 2, 3, 4, 6, 8, 12]
+HORIZONS = range(1, 16)
 MAX_DISTANCE_METERS = 5000
 
-HORIZON = 1
-TRAINING_THRESHOLDS = list(range(2011, 2025))  # train <= threshold, test > threshold
+TRAIN_END_YEAR = 2018
+VALID_END_YEAR = 2021
+TEST_START_YEAR = 2022
+TEST_END_YEAR = 2025
 
-PLOT_FILE = os.path.join(base_dir, "xgboost_rmse_mae_vs_training_threshold.png")
-METRICS_FILE = os.path.join(base_dir, "xgboost_training_threshold_metrics.csv")
+PLOT_FILE = os.path.join(base_dir, "multi_model_horizon_rmse_plot.png")
 
 
 # -----------------------------
@@ -105,7 +108,7 @@ def add_population_and_idhm(data_df, municipio_name):
     pop_df["municipio"] = pop_df["municipio"].astype(str).str.strip()
 
     idhm_df = pd.read_csv(IDHM_FILE)
-    idhm_df.columns = [c.strip().lower() for c in idhm_df.columns]
+    idhm_df.columns = [c.strip().lower() for c in df.columns] if False else [c.strip().lower() for c in idhm_df.columns]
     idhm_df["municipio"] = idhm_df["municipio"].astype(str).str.strip()
 
     pop_val = pop_df.loc[
@@ -232,7 +235,9 @@ def build_base_dataframe():
     )
 
     data_df = add_population_and_idhm(data_df, municipio_info["name"])
-    data_df = data_df[(data_df["year"] >= 2010) & (data_df["year"] <= 2025)].reset_index(drop=True)
+    data_df = data_df[(data_df["year"] >= 2010) & (data_df["year"] <= 2025)].reset_index(
+        drop=True
+    )
     data_df = data_df.sort_values(["year", "week"]).reset_index(drop=True)
 
     return data_df
@@ -289,123 +294,133 @@ def build_feature_columns(df):
     return base_cols + sorted(lag_cols)
 
 
+def fit_and_predict(model_name, model, X_train, y_train, X_valid, y_valid, X_test):
+    if model_name == "XGBoost":
+        y_train_used = np.log1p(y_train)
+        model.fit(X_train, y_train_used)
+        valid_pred = np.expm1(model.predict(X_valid))
+        test_pred = np.expm1(model.predict(X_test))
+    else:
+        model.fit(X_train, y_train)
+        valid_pred = model.predict(X_valid)
+        test_pred = model.predict(X_test)
+
+    calib = LinearRegression()
+    calib.fit(valid_pred.reshape(-1, 1), y_valid)
+
+    valid_pred_calib = np.clip(calib.predict(valid_pred.reshape(-1, 1)), 0, None)
+    test_pred_calib = np.clip(calib.predict(test_pred.reshape(-1, 1)), 0, None)
+
+    return valid_pred_calib, test_pred_calib
+
+
 def evaluate_predictions(y_true, y_pred):
     rmse = float(np.sqrt(mean_squared_error(y_true, y_pred)))
     mae = float(mean_absolute_error(y_true, y_pred))
     r2 = float(r2_score(y_true, y_pred))
-    total_actual = float(np.sum(np.abs(y_true)))
-    wape = float(np.sum(np.abs(y_true - y_pred)) / max(total_actual, 1e-9))
-    return {"rmse": rmse, "mae": mae, "r2": r2, "wape": wape}
-
-
-def fit_xgboost_with_validation_calibration(X_train, y_train, X_valid, y_valid, X_test):
-    model = XGBRegressor(
-        n_estimators=623,
-        learning_rate=0.02081058596075694,
-        max_depth=3,
-        subsample=0.8242253369150914,
-        colsample_bytree=0.9918052007526491,
-        random_state=42,
-        objective="reg:squarederror",
-    )
-
-    y_train_log = np.log1p(y_train)
-    model.fit(X_train, y_train_log)
-
-    valid_pred_raw = np.expm1(model.predict(X_valid))
-    test_pred_raw = np.expm1(model.predict(X_test))
-
-    calib = LinearRegression()
-    calib.fit(valid_pred_raw.reshape(-1, 1), y_valid)
-
-    test_pred = np.clip(calib.predict(test_pred_raw.reshape(-1, 1)), 0, None)
-    return test_pred
+    return {"rmse": rmse, "mae": mae, "r2": r2}
 
 
 def main():
     base_df = build_base_dataframe()
     featured_df = add_features(base_df)
 
-    model_df = featured_df.copy()
-    model_df[f"TARGET_{HORIZON}W_AHEAD"] = model_df["DENGUE_CASES"].shift(-HORIZON)
-    model_df = model_df.dropna(subset=[f"TARGET_{HORIZON}W_AHEAD"]).copy()
+    model_scores = {
+        "XGBoost": [],
+        "Random Forest": [],
+        "Gradient Boosting": [],
+        "Ridge": [],
+        "Linear": [],
+    }
 
-    feature_cols = build_feature_columns(model_df)
-    model_df = model_df.dropna(subset=feature_cols).copy()
+    model_metrics = []
 
-    thresholds = []
-    rmse_scores = []
-    mae_scores = []
-    all_metrics = []
+    for horizon in HORIZONS:
+        model_df = featured_df.copy()
+        model_df[f"TARGET_{horizon}W_AHEAD"] = model_df["DENGUE_CASES"].shift(-horizon)
+        model_df = model_df.dropna(subset=[f"TARGET_{horizon}W_AHEAD"]).copy()
 
-    for threshold in TRAINING_THRESHOLDS:
-        train_mask = model_df["year"] <= threshold
-        test_mask = model_df["year"] > threshold
+        feature_cols = build_feature_columns(model_df)
+        model_df = model_df.dropna(subset=feature_cols).copy()
 
-        X_train_full = model_df.loc[train_mask, feature_cols].to_numpy(dtype=float)
-        y_train_full = model_df.loc[train_mask, f"TARGET_{HORIZON}W_AHEAD"].to_numpy(dtype=float)
-        X_test = model_df.loc[test_mask, feature_cols].to_numpy(dtype=float)
-        y_test = model_df.loc[test_mask, f"TARGET_{HORIZON}W_AHEAD"].to_numpy(dtype=float)
+        train_mask = model_df["year"] <= TRAIN_END_YEAR
+        valid_mask = (model_df["year"] > TRAIN_END_YEAR) & (model_df["year"] <= VALID_END_YEAR)
+        test_mask = (model_df["year"] >= TEST_START_YEAR) & (model_df["year"] <= TEST_END_YEAR)
 
-        if min(len(X_train_full), len(X_test)) == 0:
-            continue
-
-        # carve validation set from the end of the training period
-        valid_year = threshold
-        train_inner_mask = model_df["year"] < valid_year
-        valid_mask = model_df["year"] == valid_year
-
-        X_train = model_df.loc[train_inner_mask, feature_cols].to_numpy(dtype=float)
-        y_train = model_df.loc[train_inner_mask, f"TARGET_{HORIZON}W_AHEAD"].to_numpy(dtype=float)
+        X_train = model_df.loc[train_mask, feature_cols].to_numpy(dtype=float)
+        y_train = model_df.loc[train_mask, f"TARGET_{horizon}W_AHEAD"].to_numpy(dtype=float)
         X_valid = model_df.loc[valid_mask, feature_cols].to_numpy(dtype=float)
-        y_valid = model_df.loc[valid_mask, f"TARGET_{HORIZON}W_AHEAD"].to_numpy(dtype=float)
+        y_valid = model_df.loc[valid_mask, f"TARGET_{horizon}W_AHEAD"].to_numpy(dtype=float)
+        X_test = model_df.loc[test_mask, feature_cols].to_numpy(dtype=float)
+        y_test = model_df.loc[test_mask, f"TARGET_{horizon}W_AHEAD"].to_numpy(dtype=float)
 
         if min(len(X_train), len(X_valid), len(X_test)) == 0:
-            continue
+            raise ValueError(f"Empty split for horizon {horizon}. Check year ranges.")
 
-        test_pred = fit_xgboost_with_validation_calibration(
-            X_train, y_train, X_valid, y_valid, X_test
-        )
-        test_metrics = evaluate_predictions(y_test, test_pred)
+        models = {
+            "XGBoost": XGBRegressor(
+                n_estimators=623,
+                learning_rate=0.02081058596075694,
+                max_depth=3,
+                subsample=0.8242253369150914,
+                colsample_bytree=0.9918052007526491,
+                random_state=42,
+                objective="reg:squarederror",
+            ),
+            "Random Forest": RandomForestRegressor(
+                n_estimators=645,
+                max_depth=9,
+                random_state=42,
+            ),
+            "Gradient Boosting": GradientBoostingRegressor(
+                n_estimators=639,
+                learning_rate=0.06053197206271428,
+                subsample=0.8013654487520273,
+                random_state=42,
+            ),
+            "Ridge": Ridge(alpha=2.4304352434763596),
+            "Linear": LinearRegression(),
+        }
 
-        thresholds.append(threshold)
-        rmse_scores.append(test_metrics["rmse"])
-        mae_scores.append(test_metrics["mae"])
-        all_metrics.append(
-            {
-                "training_threshold": threshold,
-                "train_years": f"2010-{threshold}",
-                "test_years": f"{threshold + 1}-2025",
-                "test_rmse": test_metrics["rmse"],
-                "test_mae": test_metrics["mae"],
-                "test_r2": test_metrics["r2"],
-                "test_wape": test_metrics["wape"],
-                "n_train": len(X_train_full),
-                "n_test": len(X_test),
-            }
-        )
+        for name, model in models.items():
+            valid_pred, test_pred = fit_and_predict(
+                name, model, X_train, y_train, X_valid, y_valid, X_test
+            )
+            valid_metrics = evaluate_predictions(y_valid, valid_pred)
+            test_metrics = evaluate_predictions(y_test, test_pred)
 
-        print(
-            f"Train 2010-{threshold}, Test {threshold + 1}-2025: "
-            f"RMSE={test_metrics['rmse']:.2f}, "
-            f"MAE={test_metrics['mae']:.2f}, "
-            f"R2={test_metrics['r2']:.4f}, "
-            f"WAPE={test_metrics['wape']:.4f}"
-        )
+            model_scores[name].append(test_metrics["rmse"])
+            model_metrics.append(
+                {
+                    "horizon": horizon,
+                    "model": name,
+                    "valid_r2": valid_metrics["r2"],
+                    "valid_rmse": valid_metrics["rmse"],
+                    "valid_mae": valid_metrics["mae"],
+                    "test_r2": test_metrics["r2"],
+                    "test_rmse": test_metrics["rmse"],
+                    "test_mae": test_metrics["mae"],
+                }
+            )
 
-    metrics_df = pd.DataFrame(all_metrics)
-    metrics_df.to_csv(METRICS_FILE, index=False)
-    print(f"Saved metrics to: {METRICS_FILE}")
+    metrics_df = pd.DataFrame(model_metrics)
+    metrics_path = os.path.join(base_dir, "multi_model_horizon_metrics.csv")
+    metrics_df.to_csv(metrics_path, index=False)
+    print(f"Saved metrics to: {metrics_path}")
 
-    plt.figure(figsize=(6, 3.5), dpi=300)
-    plt.plot(thresholds, rmse_scores, marker="o", linewidth=1.8, label="RMSE")
-    plt.plot(thresholds, mae_scores, marker="s", linewidth=1.8, label="MAE")
-    plt.xlabel("Training Threshold Year", fontsize=10)
-    plt.ylabel("Error", fontsize=10)
-    plt.title("XGBoost: RMSE and MAE vs Training Threshold", fontsize=12)
-    plt.xticks(thresholds[::2] if len(thresholds) > 1 else thresholds)
+    x_values = np.arange(1, len(model_scores["XGBoost"]) + 1)
+    plt.figure(figsize=(6, 4), dpi=300)
+
+    for name, scores in model_scores.items():
+        plt.plot(x_values, scores, marker="o", markersize=4, linewidth=1.8, label=name)
+
+    plt.xlabel("Horizon (weeks)", fontsize=10, fontweight="bold")
+    plt.ylabel("Test RMSE", fontsize=10, fontweight="bold")
+    plt.title("Model Comparison: Test RMSE vs Forecast Horizon", fontsize=12, fontweight="bold")
+    plt.xticks(x_values[::2])
     plt.tick_params(axis="both", which="both", length=6)
-    plt.legend(fontsize=5, frameon=True)
+    plt.yticks(fontsize=8)
+    plt.legend(fontsize=7, frameon=True)
     plt.grid(False)
     plt.tight_layout()
     plt.savefig(PLOT_FILE, dpi=300, bbox_inches="tight")
