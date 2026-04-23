@@ -8,6 +8,7 @@ from shapely.ops import unary_union
 from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
 from sklearn.linear_model import LinearRegression, Ridge
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.preprocessing import StandardScaler
 from xgboost import XGBRegressor
 
 
@@ -22,36 +23,45 @@ CASES_FILE = os.path.join(data_dir, "cases.csv")
 TEMP_FILE = os.path.join(data_dir, "temperature.csv")
 HUMID_FILE = os.path.join(data_dir, "humidity.csv")
 RAIN_FILE = os.path.join(data_dir, "rainfall.csv")
-IDHM_FILE = os.path.join(data_dir, "idhm.csv")
-POP_FILE = os.path.join(data_dir, "population.csv")
 GEOJSON_FILE = os.path.join(data_dir, "RJ.json")
 
 LAGS = [1, 2, 3, 4, 6, 8, 12]
 HORIZONS = range(1, 16)
 MAX_DISTANCE_METERS = 5000
 
-TRAIN_END_YEAR = 2018
-VALID_END_YEAR = 2021
-TEST_START_YEAR = 2022
+TRAIN_END_YEAR = 2010
+VALID_END_YEAR = 2013
+TEST_START_YEAR = 2014
 TEST_END_YEAR = 2025
 
+CALIBRATE_PREDICTIONS = True
+
 PLOT_FILE = os.path.join(base_dir, "multi_model_horizon_rmse_plot.png")
+METRICS_FILE = os.path.join(base_dir, "multi_model_horizon_metrics.csv")
 
 
 # -----------------------------
-# Helpers
+# Loading helpers
 # -----------------------------
 def load_csv_data_single(file, municipio, value_col_name):
     df = pd.read_csv(file)
     df.columns = [c.strip().lower() for c in df.columns]
     df["municipio"] = df["municipio"].astype(str).str.strip()
+    df["year"] = pd.to_numeric(df["year"], errors="coerce")
+    df["week"] = pd.to_numeric(df["week"], errors="coerce")
+    value_col_name = value_col_name.lower()
+    df[value_col_name] = pd.to_numeric(df[value_col_name], errors="coerce")
+
     df = df[df["municipio"].str.upper() == municipio.upper()]
-    df = (
-        df[["year", "week", value_col_name.lower()]]
+    df = df.dropna(subset=["year", "week", value_col_name]).copy()
+    df["year"] = df["year"].astype(int)
+    df["week"] = df["week"].astype(int)
+
+    return (
+        df[["year", "week", value_col_name]]
         .sort_values(["year", "week"])
         .reset_index(drop=True)
     )
-    return df
 
 
 def load_csv_data_all(file, value_col_name):
@@ -64,7 +74,19 @@ def load_csv_data_all(file, value_col_name):
     df = df[["municipio", "year", "week", value_col_name]].copy()
     df.rename(columns={value_col_name: "value"}, inplace=True)
     df["municipio"] = df["municipio"].astype(str).str.strip()
+    df["year"] = pd.to_numeric(df["year"], errors="coerce")
+    df["week"] = pd.to_numeric(df["week"], errors="coerce")
+    df["value"] = pd.to_numeric(df["value"], errors="coerce")
+    df = df.dropna(subset=["municipio", "year", "week", "value"]).copy()
+    df["year"] = df["year"].astype(int)
+    df["week"] = df["week"].astype(int)
     return df
+
+
+def previous_iso_week(year, week):
+    ts = pd.Timestamp.fromisocalendar(int(year), int(week), 1) - pd.Timedelta(weeks=1)
+    iso = ts.isocalendar()
+    return int(iso.year), int(iso.week)
 
 
 def build_adjacency_list(geojson_file, max_distance_meters):
@@ -102,27 +124,9 @@ def build_adjacency_list(geojson_file, max_distance_meters):
     return {k: sorted(v) for k, v in adjacency_list.items()}
 
 
-def add_population_and_idhm(data_df, municipio_name):
-    pop_df = pd.read_csv(POP_FILE)
-    pop_df.columns = [c.strip().lower() for c in pop_df.columns]
-    pop_df["municipio"] = pop_df["municipio"].astype(str).str.strip()
-
-    idhm_df = pd.read_csv(IDHM_FILE)
-    idhm_df.columns = [c.strip().lower() for c in df.columns] if False else [c.strip().lower() for c in idhm_df.columns]
-    idhm_df["municipio"] = idhm_df["municipio"].astype(str).str.strip()
-
-    pop_val = pop_df.loc[
-        pop_df["municipio"].str.upper() == municipio_name.upper(), "population"
-    ].iloc[0]
-    idhm_val = idhm_df.loc[
-        idhm_df["municipio"].str.upper() == municipio_name.upper(), "idhm"
-    ].iloc[0]
-
-    data_df["POPULATION"] = pop_val
-    data_df["IDHM"] = idhm_val
-    return data_df
-
-
+# -----------------------------
+# Feature engineering
+# -----------------------------
 def build_base_dataframe():
     rio_cases_df = load_csv_data_single(CASES_FILE, municipio_info["name"], "cases")
     rio_temp_df = load_csv_data_single(TEMP_FILE, municipio_info["name"], "temperature")
@@ -130,9 +134,9 @@ def build_base_dataframe():
     rio_rain_df = load_csv_data_single(RAIN_FILE, municipio_info["name"], "rainfall")
 
     data_df = (
-        rio_cases_df.merge(rio_temp_df, on=["year", "week"])
-        .merge(rio_hum_df, on=["year", "week"])
-        .merge(rio_rain_df, on=["year", "week"])
+        rio_cases_df.merge(rio_temp_df, on=["year", "week"], how="inner")
+        .merge(rio_hum_df, on=["year", "week"], how="inner")
+        .merge(rio_rain_df, on=["year", "week"], how="inner")
     )
     data_df.rename(
         columns={
@@ -151,31 +155,30 @@ def build_base_dataframe():
     neighbors = adjacency_list[municipio_info["name"]]
     print("Neighbors for", municipio_info["name"], ":", neighbors)
 
-    cases_all = load_csv_data_all(CASES_FILE, "cases")
-    temp_all = load_csv_data_all(TEMP_FILE, "temperature")
-    hum_all = load_csv_data_all(HUMID_FILE, "humidity")
-    rain_all = load_csv_data_all(RAIN_FILE, "rainfall")
-
     cases_idx = (
-        cases_all.groupby(["year", "week", "municipio"])["value"]
+        load_csv_data_all(CASES_FILE, "cases")
+        .groupby(["year", "week", "municipio"])["value"]
         .first()
         .reset_index()
         .set_index(["year", "week", "municipio"])
     )
     temp_idx = (
-        temp_all.groupby(["year", "week", "municipio"])["value"]
+        load_csv_data_all(TEMP_FILE, "temperature")
+        .groupby(["year", "week", "municipio"])["value"]
         .first()
         .reset_index()
         .set_index(["year", "week", "municipio"])
     )
     hum_idx = (
-        hum_all.groupby(["year", "week", "municipio"])["value"]
+        load_csv_data_all(HUMID_FILE, "humidity")
+        .groupby(["year", "week", "municipio"])["value"]
         .first()
         .reset_index()
         .set_index(["year", "week", "municipio"])
     )
     rain_idx = (
-        rain_all.groupby(["year", "week", "municipio"])["value"]
+        load_csv_data_all(RAIN_FILE, "rainfall")
+        .groupby(["year", "week", "municipio"])["value"]
         .first()
         .reset_index()
         .set_index(["year", "week", "municipio"])
@@ -184,42 +187,44 @@ def build_base_dataframe():
     cases_spatial, rain_spatial, temp_spatial, hum_spatial, n_neighbors = [], [], [], [], []
 
     for _, row in data_df.iterrows():
-        y = int(row["year"])
-        w = int(row["week"]) - 1
-        if w <= 0:
-            y -= 1
-            w = 52
+        y_prev, w_prev = previous_iso_week(row["year"], row["week"])
 
-        neigh_vals_cases, neigh_vals_rain, neigh_vals_temp, neigh_vals_hum = [], [], [], []
-        for n in neighbors:
+        neigh_cases, neigh_rain, neigh_temp, neigh_hum = [], [], [], []
+        for neighbor in neighbors:
             try:
-                neigh_vals_cases.append(cases_idx.loc[(y, w, n), "value"])
+                neigh_cases.append(cases_idx.loc[(y_prev, w_prev, neighbor), "value"])
             except KeyError:
                 pass
             try:
-                neigh_vals_rain.append(rain_idx.loc[(y, w, n), "value"])
+                neigh_rain.append(rain_idx.loc[(y_prev, w_prev, neighbor), "value"])
             except KeyError:
                 pass
             try:
-                neigh_vals_temp.append(temp_idx.loc[(y, w, n), "value"])
+                neigh_temp.append(temp_idx.loc[(y_prev, w_prev, neighbor), "value"])
             except KeyError:
                 pass
             try:
-                neigh_vals_hum.append(hum_idx.loc[(y, w, n), "value"])
+                neigh_hum.append(hum_idx.loc[(y_prev, w_prev, neighbor), "value"])
             except KeyError:
                 pass
 
-        cases_spatial.append(np.mean(neigh_vals_cases) if neigh_vals_cases else np.nan)
-        rain_spatial.append(np.mean(neigh_vals_rain) if neigh_vals_rain else np.nan)
-        temp_spatial.append(np.mean(neigh_vals_temp) if neigh_vals_temp else np.nan)
-        hum_spatial.append(np.mean(neigh_vals_hum) if neigh_vals_hum else np.nan)
-        n_neighbors.append(len(neigh_vals_cases))
+        cases_spatial.append(np.mean(neigh_cases) if neigh_cases else np.nan)
+        rain_spatial.append(np.mean(neigh_rain) if neigh_rain else np.nan)
+        temp_spatial.append(np.mean(neigh_temp) if neigh_temp else np.nan)
+        hum_spatial.append(np.mean(neigh_hum) if neigh_hum else np.nan)
+        n_neighbors.append(len(neigh_cases))
 
     data_df["CASES_SPATIAL_LAG1"] = cases_spatial
     data_df["RAINFALL_SPATIAL_LAG1"] = rain_spatial
     data_df["TEMP_SPATIAL_LAG1"] = temp_spatial
     data_df["HUMIDITY_SPATIAL_LAG1"] = hum_spatial
     data_df["NUM_NEIGHBORS_AVAILABLE"] = n_neighbors
+
+    # Missingness is recorded before fallback imputation.
+    data_df["CASES_SPATIAL_MISSING"] = data_df["CASES_SPATIAL_LAG1"].isna().astype(int)
+    data_df["RAINFALL_SPATIAL_MISSING"] = data_df["RAINFALL_SPATIAL_LAG1"].isna().astype(int)
+    data_df["TEMP_SPATIAL_MISSING"] = data_df["TEMP_SPATIAL_LAG1"].isna().astype(int)
+    data_df["HUMIDITY_SPATIAL_MISSING"] = data_df["HUMIDITY_SPATIAL_LAG1"].isna().astype(int)
 
     data_df["CASES_SPATIAL_LAG1"] = data_df["CASES_SPATIAL_LAG1"].fillna(
         data_df["DENGUE_CASES"].shift(1)
@@ -234,12 +239,8 @@ def build_base_dataframe():
         data_df["HUMIDITY"].shift(1)
     )
 
-    data_df = add_population_and_idhm(data_df, municipio_info["name"])
-    data_df = data_df[(data_df["year"] >= 2010) & (data_df["year"] <= 2025)].reset_index(
-        drop=True
-    )
+    data_df = data_df[(data_df["year"] >= 2010) & (data_df["year"] <= 2025)].copy()
     data_df = data_df.sort_values(["year", "week"]).reset_index(drop=True)
-
     return data_df
 
 
@@ -263,82 +264,131 @@ def add_features(df):
         df[f"{col}_roll3"] = df[col].shift(1).rolling(3, min_periods=1).mean()
 
     decay = 0.8
-    K = 10
-    cases_series = df["DENGUE_CASES"].to_numpy()
-    immunity = []
-    for i in range(len(cases_series)):
-        past_cases = sum(
-            cases_series[i - k] * np.exp(-decay * k)
-            for k in range(1, K + 1)
-            if i - k >= 0
-        )
-        immunity.append(past_cases)
-    df["IMMUNITY"] = immunity
+    k_max = 10
+    cases = df["DENGUE_CASES"].to_numpy()
+    df["IMMUNITY"] = [
+        sum(cases[i - k] * np.exp(-decay * k) for k in range(1, k_max + 1) if i - k >= 0)
+        for i in range(len(cases))
+    ]
 
     df["YEAR_INDEX"] = (
-        (df["year"].astype(int) - df["year"].astype(int).min()) * 52 + df["week"].astype(int)
+        (df["year"].astype(int) - df["year"].astype(int).min()) * 52
+        + df["week"].astype(int)
     )
+
+    week_float = df["week"].astype(float)
+    df["WEEK_SIN"] = np.sin(2 * np.pi * week_float / 52.0)
+    df["WEEK_COS"] = np.cos(2 * np.pi * week_float / 52.0)
 
     return df
 
 
 def build_feature_columns(df):
     base_cols = [
-        "POPULATION",
-        "IDHM",
         "IMMUNITY",
         "NUM_NEIGHBORS_AVAILABLE",
         "YEAR_INDEX",
+        "WEEK_SIN",
+        "WEEK_COS",
+        "CASES_SPATIAL_MISSING",
+        "RAINFALL_SPATIAL_MISSING",
+        "TEMP_SPATIAL_MISSING",
+        "HUMIDITY_SPATIAL_MISSING",
     ]
     lag_cols = [c for c in df.columns if "_lag" in c or "_roll" in c]
     return base_cols + sorted(lag_cols)
 
 
-def fit_and_predict(model_name, model, X_train, y_train, X_valid, y_valid, X_test):
-    if model_name == "XGBoost":
-        y_train_used = np.log1p(y_train)
-        model.fit(X_train, y_train_used)
-        valid_pred = np.expm1(model.predict(X_valid))
-        test_pred = np.expm1(model.predict(X_test))
-    else:
-        model.fit(X_train, y_train)
-        valid_pred = model.predict(X_valid)
-        test_pred = model.predict(X_test)
-
-    calib = LinearRegression()
-    calib.fit(valid_pred.reshape(-1, 1), y_valid)
-
-    valid_pred_calib = np.clip(calib.predict(valid_pred.reshape(-1, 1)), 0, None)
-    test_pred_calib = np.clip(calib.predict(test_pred.reshape(-1, 1)), 0, None)
-
-    return valid_pred_calib, test_pred_calib
-
-
+# -----------------------------
+# Modeling
+# -----------------------------
 def evaluate_predictions(y_true, y_pred):
     rmse = float(np.sqrt(mean_squared_error(y_true, y_pred)))
     mae = float(mean_absolute_error(y_true, y_pred))
     r2 = float(r2_score(y_true, y_pred))
-    return {"rmse": rmse, "mae": mae, "r2": r2}
+    total_actual = float(np.sum(np.abs(y_true)))
+    wape = float(np.sum(np.abs(y_true - y_pred)) / max(total_actual, 1e-9))
+    return {"rmse": rmse, "mae": mae, "r2": r2, "wape": wape}
+
+
+def make_model(name):
+    if name == "XGBoost":
+        return XGBRegressor(
+            n_estimators=623,
+            learning_rate=0.02081058596075694,
+            max_depth=3,
+            subsample=0.8242253369150914,
+            colsample_bytree=0.9918052007526491,
+            random_state=42,
+            objective="reg:squarederror",
+        )
+    if name == "Random Forest":
+        return RandomForestRegressor(
+            n_estimators=645,
+            max_depth=9,
+            random_state=42,
+        )
+    if name == "Gradient Boosting":
+        return GradientBoostingRegressor(
+            n_estimators=639,
+            learning_rate=0.06053197206271428,
+            subsample=0.8013654487520273,
+            random_state=42,
+        )
+    if name == "Ridge":
+        return Ridge(alpha=2.4304352434763596)
+    if name == "Linear":
+        return LinearRegression()
+    raise ValueError(f"Unknown model: {name}")
+
+
+def fit_and_predict(model_name, X_train, y_train, X_valid, y_valid, X_test):
+    model = make_model(model_name)
+
+    if model_name in {"Linear", "Ridge"}:
+        scaler = StandardScaler()
+        X_train_fit = scaler.fit_transform(X_train)
+        X_valid_fit = scaler.transform(X_valid)
+        X_test_fit = scaler.transform(X_test)
+    else:
+        X_train_fit = X_train
+        X_valid_fit = X_valid
+        X_test_fit = X_test
+
+    if model_name == "XGBoost":
+        model.fit(X_train_fit, np.log1p(y_train))
+        valid_pred = np.expm1(model.predict(X_valid_fit))
+        test_pred = np.expm1(model.predict(X_test_fit))
+    else:
+        model.fit(X_train_fit, y_train)
+        valid_pred = model.predict(X_valid_fit)
+        test_pred = model.predict(X_test_fit)
+
+    valid_pred = np.clip(valid_pred, 0, None)
+    test_pred = np.clip(test_pred, 0, None)
+
+    if CALIBRATE_PREDICTIONS:
+        calibrator = LinearRegression()
+        calibrator.fit(valid_pred.reshape(-1, 1), y_valid)
+        valid_pred = np.clip(calibrator.predict(valid_pred.reshape(-1, 1)), 0, None)
+        test_pred = np.clip(calibrator.predict(test_pred.reshape(-1, 1)), 0, None)
+
+    return valid_pred, test_pred
 
 
 def main():
     base_df = build_base_dataframe()
     featured_df = add_features(base_df)
 
-    model_scores = {
-        "XGBoost": [],
-        "Random Forest": [],
-        "Gradient Boosting": [],
-        "Ridge": [],
-        "Linear": [],
-    }
-
+    model_names = ["XGBoost", "Random Forest", "Gradient Boosting", "Ridge", "Linear"]
+    model_scores = {name: [] for name in model_names}
     model_metrics = []
 
     for horizon in HORIZONS:
+        target_col = f"TARGET_{horizon}W_AHEAD"
         model_df = featured_df.copy()
-        model_df[f"TARGET_{horizon}W_AHEAD"] = model_df["DENGUE_CASES"].shift(-horizon)
-        model_df = model_df.dropna(subset=[f"TARGET_{horizon}W_AHEAD"]).copy()
+        model_df[target_col] = model_df["DENGUE_CASES"].shift(-horizon)
+        model_df = model_df.dropna(subset=[target_col]).copy()
 
         feature_cols = build_feature_columns(model_df)
         model_df = model_df.dropna(subset=feature_cols).copy()
@@ -348,71 +398,63 @@ def main():
         test_mask = (model_df["year"] >= TEST_START_YEAR) & (model_df["year"] <= TEST_END_YEAR)
 
         X_train = model_df.loc[train_mask, feature_cols].to_numpy(dtype=float)
-        y_train = model_df.loc[train_mask, f"TARGET_{horizon}W_AHEAD"].to_numpy(dtype=float)
+        y_train = model_df.loc[train_mask, target_col].to_numpy(dtype=float)
         X_valid = model_df.loc[valid_mask, feature_cols].to_numpy(dtype=float)
-        y_valid = model_df.loc[valid_mask, f"TARGET_{horizon}W_AHEAD"].to_numpy(dtype=float)
+        y_valid = model_df.loc[valid_mask, target_col].to_numpy(dtype=float)
         X_test = model_df.loc[test_mask, feature_cols].to_numpy(dtype=float)
-        y_test = model_df.loc[test_mask, f"TARGET_{horizon}W_AHEAD"].to_numpy(dtype=float)
+        y_test = model_df.loc[test_mask, target_col].to_numpy(dtype=float)
 
         if min(len(X_train), len(X_valid), len(X_test)) == 0:
             raise ValueError(f"Empty split for horizon {horizon}. Check year ranges.")
 
-        models = {
-            "XGBoost": XGBRegressor(
-                n_estimators=623,
-                learning_rate=0.02081058596075694,
-                max_depth=3,
-                subsample=0.8242253369150914,
-                colsample_bytree=0.9918052007526491,
-                random_state=42,
-                objective="reg:squarederror",
-            ),
-            "Random Forest": RandomForestRegressor(
-                n_estimators=645,
-                max_depth=9,
-                random_state=42,
-            ),
-            "Gradient Boosting": GradientBoostingRegressor(
-                n_estimators=639,
-                learning_rate=0.06053197206271428,
-                subsample=0.8013654487520273,
-                random_state=42,
-            ),
-            "Ridge": Ridge(alpha=2.4304352434763596),
-            "Linear": LinearRegression(),
-        }
-
-        for name, model in models.items():
+        for model_name in model_names:
             valid_pred, test_pred = fit_and_predict(
-                name, model, X_train, y_train, X_valid, y_valid, X_test
+                model_name, X_train, y_train, X_valid, y_valid, X_test
             )
             valid_metrics = evaluate_predictions(y_valid, valid_pred)
             test_metrics = evaluate_predictions(y_test, test_pred)
 
-            model_scores[name].append(test_metrics["rmse"])
+            model_scores[model_name].append(test_metrics["rmse"])
             model_metrics.append(
                 {
                     "horizon": horizon,
-                    "model": name,
+                    "model": model_name,
+                    "calibrated": CALIBRATE_PREDICTIONS,
                     "valid_r2": valid_metrics["r2"],
                     "valid_rmse": valid_metrics["rmse"],
                     "valid_mae": valid_metrics["mae"],
+                    "valid_wape": valid_metrics["wape"],
                     "test_r2": test_metrics["r2"],
                     "test_rmse": test_metrics["rmse"],
                     "test_mae": test_metrics["mae"],
+                    "test_wape": test_metrics["wape"],
                 }
             )
 
+            print(
+                f"Horizon {horizon}, {model_name}: "
+                f"test_rmse={test_metrics['rmse']:.2f}, "
+                f"test_mae={test_metrics['mae']:.2f}, "
+                f"test_r2={test_metrics['r2']:.4f}, "
+                f"test_wape={test_metrics['wape']:.4f}"
+            )
+
     metrics_df = pd.DataFrame(model_metrics)
-    metrics_path = os.path.join(base_dir, "multi_model_horizon_metrics.csv")
-    metrics_df.to_csv(metrics_path, index=False)
-    print(f"Saved metrics to: {metrics_path}")
+    metrics_df.to_csv(METRICS_FILE, index=False)
+    print(f"Saved metrics to: {METRICS_FILE}")
 
     x_values = np.arange(1, len(model_scores["XGBoost"]) + 1)
     plt.figure(figsize=(6, 4), dpi=300)
 
-    for name, scores in model_scores.items():
-        plt.plot(x_values, scores, marker="o", markersize=4, linewidth=1.8, label=name)
+    for model_name, scores in model_scores.items():
+        plt.plot(
+            x_values,
+            scores,
+            marker="o",
+            markersize=4,
+            linewidth=1.8,
+            label=model_name,
+        )
 
     plt.xlabel("Horizon (weeks)", fontsize=10, fontweight="bold")
     plt.ylabel("Test RMSE", fontsize=10, fontweight="bold")
