@@ -411,8 +411,28 @@ def main():
     x_values = np.arange(1, len(model_scores["XGBoost"]) + 1)
     plt.figure(figsize=(6, 4), dpi=300)
 
-    for name, scores in model_scores.items():
-        plt.plot(x_values, scores, marker="o", markersize=4, linewidth=1.8, label=name)
+    line_styles = {
+        "XGBoost": "-",
+        "Random Forest": "--",
+        "Gradient Boosting": "-.",
+        "Linear": "-",
+        "Ridge": ":",
+    }
+
+    plot_order = ["XGBoost", "Random Forest", "Gradient Boosting", "Linear", "Ridge"]
+
+    for name in plot_order:
+        scores = model_scores[name]
+        plt.plot(
+            x_values,
+            scores,
+            marker="o",
+            markersize=4,
+            linewidth=2.0 if name == "Ridge" else 1.2,
+            linestyle=line_styles[name],
+            label=name,
+            zorder=5 if name == "Ridge" else 3,
+        )
 
     plt.xlabel("Horizon (weeks)", fontsize=10, fontweight="bold")
     plt.ylabel("Test RMSE", fontsize=10, fontweight="bold")
@@ -425,6 +445,7 @@ def main():
     plt.tight_layout()
     plt.savefig(PLOT_FILE, dpi=300, bbox_inches="tight")
     plt.show()
+
 
 
 if __name__ == "__main__":
